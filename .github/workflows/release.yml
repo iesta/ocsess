@@ -64,6 +64,9 @@ jobs:
 
   macos:
     needs: test
+    # GitHub's macOS runner pool is frequently at capacity and the job is
+    # dropped after ~15 minutes. Do not let that block the Linux release.
+    continue-on-error: true
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -95,7 +98,10 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [linux, macos]
+    needs: [test, linux, macos]
+    # Publish whatever built. A macOS outage leaves those assets out of the
+    # release and out of SHA256SUMS, so install.sh refuses them clearly.
+    if: always() && needs.test.result == 'success' && needs.linux.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
