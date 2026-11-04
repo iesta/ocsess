@@ -1,0 +1,115 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v0.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --locked
+
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          set -eu
+          name="ocsess-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/ocsess" "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    needs: test
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          set -eu
+          name="ocsess-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/ocsess" "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -eu
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: dist/*
+          generate_release_notes: true

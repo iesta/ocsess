@@ -17,17 +17,20 @@ A keyboard-first TUI for browsing and managing OpenCode sessions.
 
 ## Install
 
-Requires Rust 1.89+ and OpenCode.
+Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Intel, Apple Silicon):
 
 ```bash
-cargo build --release
-./target/release/ocsess
+curl -sSfL https://raw.githubusercontent.com/iesta/ocsess/main/install.sh | sh
 ```
 
-Or install the binary:
+The script installs to `~/.local/bin`; set `OCSESS_INSTALL_DIR` to change that and `OCSESS_VERSION=v0.2.1` to pin a release. It verifies the SHA256 sum before installing.
+
+From source, with Rust 1.89+:
 
 ```bash
-cargo install --path .
+cargo install --git https://github.com/iesta/ocsess    # install the binary
+cargo build --release                                  # or build a checkout
+./target/release/ocsess
 ```
 
 ## Usage
