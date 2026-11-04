@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -114,12 +115,25 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Merge the API's active set into database sessions. When the service is
+/// unreachable the last answer is not evidence, so the database state wins.
+pub fn apply_active(sessions: &mut [Session], active_ids: &HashSet<String>, online: bool) {
+    for session in sessions {
+        session.active = online && active_ids.contains(&session.id);
+        if online && !session.active {
+            // The service answered, so its active list wins over the heuristic
+            // busy mark derived from the idle timestamp.
+            session.time_busy = None;
+        }
+    }
+}
+
 /// A session that has updated after its idle mark is working again. Bounded in
 /// time because a session killed mid-run never writes a newer idle mark and
 /// would otherwise look busy forever.
 pub const BUSY_WINDOW_MS: i64 = 15 * 60 * 1000;
 
-/// OpenCode v2 dropped `time.busy` from both the database and the API, so
+/// Some v2 databases omit `time.busy` from both the database and the API, so
 /// derive it from the idle mark instead.
 pub fn derive_busy(updated: i64, idle: Option<i64>) -> Option<i64> {
     let idle = idle?;
@@ -127,10 +141,14 @@ pub fn derive_busy(updated: i64, idle: Option<i64>) -> Option<i64> {
 }
 
 pub fn format_relative(ms: i64) -> String {
+    format_relative_at(ms, now_ms())
+}
+
+pub fn format_relative_at(ms: i64, now: i64) -> String {
     if ms <= 0 {
         return "—".to_string();
     }
-    let diff = (now_ms() - ms).max(0);
+    let diff = (now - ms).max(0);
     const MINUTE: i64 = 60_000;
     const HOUR: i64 = 60 * MINUTE;
     const DAY: i64 = 24 * HOUR;
@@ -320,19 +338,20 @@ fn columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
         .map_err(|e| format!("read {table} columns: {e}"))
 }
 
-/// v2 dropped `time_busy`. A session that has updated past its idle mark is
-/// working; the API's active list overrides this when the service is reachable.
+/// v2 databases may keep a nullable `time_busy` that is only set while a run is
+/// live. Fall back to the idle mark so a recent update still reads as working,
+/// and keep the API's active list as the final word when the service is up.
 fn busy_expr(schema: &Schema) -> String {
-    if schema.has("time_busy") {
-        "s.time_busy".to_string()
-    } else if schema.has("time_idle") {
-        format!(
-            "CASE WHEN s.time_updated > s.time_idle AND s.time_updated > {} \
-             THEN s.time_updated END",
-            now_ms() - BUSY_WINDOW_MS
-        )
-    } else {
-        "NULL".to_string()
+    let derived = format!(
+        "CASE WHEN s.time_updated > s.time_idle AND s.time_updated > {} \
+         THEN s.time_updated END",
+        now_ms() - BUSY_WINDOW_MS
+    );
+    match (schema.has("time_busy"), schema.has("time_idle")) {
+        (true, true) => format!("COALESCE(s.time_busy, {derived})"),
+        (true, false) => "s.time_busy".to_string(),
+        (false, true) => derived,
+        (false, false) => "NULL".to_string(),
     }
 }
 
@@ -542,6 +561,19 @@ pub fn summarize(calls: &[Call]) -> CallSummary {
 pub fn load_calls(path: &Path, session_id: &str) -> Result<Vec<Call>, String> {
     let conn = open_db(path)?;
     query_calls(&conn, session_id)
+}
+
+/// Whether this database knows the session. Lets the web view answer 404 for a
+/// typo instead of an empty call list.
+pub fn session_exists(path: &Path, session_id: &str) -> Result<bool, String> {
+    let conn = open_db(path)?;
+    let schema = Schema::detect(&conn)?;
+    let sql = format!("SELECT 1 FROM {} WHERE id = ?1 LIMIT 1", schema.sessions);
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("query session: {e}"))?;
+    stmt.exists([session_id])
+        .map_err(|e| format!("read session: {e}"))
 }
 
 fn query_calls(conn: &Connection, session_id: &str) -> Result<Vec<Call>, String> {
@@ -759,11 +791,13 @@ mod tests {
 
     #[test]
     fn relative_formats() {
-        let now = now_ms();
-        assert_eq!(format_relative(now - 45_000), "now");
-        assert_eq!(format_relative(now - 59_999), "now");
-        assert_eq!(format_relative(now - 60_000), "1m");
-        assert_eq!(format_relative(now - 3_600_000), "1h");
+        let now = 1_000_000_000;
+        assert_eq!(format_relative_at(now - 45_000, now), "now");
+        assert_eq!(format_relative_at(now - 59_999, now), "now");
+        assert_eq!(format_relative_at(now - 60_000, now), "1m");
+        assert_eq!(format_relative_at(now - 3_600_000, now), "1h");
+        assert_eq!(format_relative_at(now - 86_400_000, now), "1d");
+        assert_eq!(format_relative_at(0, now), "—");
     }
 
     #[test]

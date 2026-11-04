@@ -7,6 +7,7 @@ A keyboard-first TUI for browsing and managing OpenCode sessions.
 ## Features
 
 - Live sessions table: read-only SQLite polling every 700 ms, running state from the OpenCode API every 2 s.
+- Optional read-only web view on localhost (`--serve`), refreshed every second.
 - Works with both OpenCode schema generations: v1 (`session`, `message`, `part`) and v2 (`session_v2`, `session_message`). The layout and columns are detected at load time.
 - Sort, global search, per-column filters, show/hide/reorder columns, adjustable widths.
 - Open a session directly in its directory with `opencode -s <id> <dir>`.
@@ -38,10 +39,30 @@ cargo build --release                                  # or build a checkout
 ```bash
 ocsess                 # TUI
 ocsess --dump          # sessions as TSV, no TUI
+ocsess --serve [PORT]  # read-only web view on 127.0.0.1 (default 8765)
 ocsess --db PATH       # explicit SQLite database
 ```
 
 The TUI reads `~/.local/share/opencode/opencode.db` in read-only mode. Actions go through the local OpenCode API (`~/.local/state/opencode/service.json`).
+
+## Web view
+
+```bash
+ocsess --serve          # http://127.0.0.1:8765
+ocsess --serve 8080     # custom port
+ocsess --serve=8080     # same, one argument
+```
+
+Read-only and bound to loopback. The page refreshes itself every second, supports search, sorting, archived filtering, and opens a per-call detail view when you click a row. Actions stay in the TUI.
+
+Web endpoints (read-only, GET/HEAD only):
+
+| Route | Response |
+|-------|----------|
+| `GET /` | the page |
+| `GET /api/sessions` | cached session list (refreshed every second) |
+| `GET /api/sessions/{id}/calls` | per-call detail for one session |
+| `GET /api/health` | `ok`, session count, API status |
 
 ## Keys
 

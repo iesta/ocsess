@@ -9,6 +9,7 @@ cargo run                    # dev
 cargo test                   # unit checks for filter/sort/state parsing
 cargo build --release        # binary at target/release/ocsess
 cargo run -- --dump          # headless: print rows, no TUI (debugging)
+cargo run -- --serve 8765    # read-only web view on 127.0.0.1
 ```
 
 ## Layout
@@ -20,6 +21,8 @@ cargo run -- --dump          # headless: print rows, no TUI (debugging)
 | `src/db.rs` | Read-only SQLite queries, `Session` row mapping, status derivation |
 | `src/api.rs` | OpenCode service discovery, HTTP actions, backup export |
 | `src/ui.rs` | Table, header, filter bar, modals, toasts |
+| `src/web.rs` | Read-only HTTP server, cached snapshot, JSON endpoints |
+| `src/web/index.html` | Embedded web page (HTML, CSS and JS inline) |
 | `src/config.rs` | Persisted columns/sort/widths in `~/.config/ocsess/config.json` |
 
 ## OpenCode data
@@ -42,6 +45,7 @@ cargo run -- --dump          # headless: print rows, no TUI (debugging)
 - Keyboard first, mouse parity: header click sorts, row click selects, double-click opens, wheel scrolls.
 - Colors are semantic: green/blue/gray/magenta states, cost heat, recency, cyan current-session marker, yellow sort arrow.
 - `i` opens a per-call detail view using `db::load_calls`; queries are on demand and auto-refresh every 2 seconds.
+- `--serve [PORT]` adds a read-only web view on `127.0.0.1` (default 8765). A background thread refreshes a cached JSON snapshot every second and merges the active set every two; handlers never touch the DB or API. No new crates: a small HTTP/1.1 GET/HEAD server over `std::net`.
 
 ## Conventions
 

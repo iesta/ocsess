@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod db;
 mod ui;
+mod web;
 
 use std::io::{self, BufWriter, Write, stdout};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ use app::{App, KeyAction};
 
 struct Args {
     dump: bool,
+    serve: bool,
+    port: Option<u16>,
     db: Option<PathBuf>,
 }
 
@@ -32,18 +35,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dump(&db_path)?;
         return Ok(());
     }
+    if args.serve {
+        web::serve(db_path, args.port.unwrap_or(8765))?;
+        return Ok(());
+    }
     run_tui(db_path)
 }
 
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = Args {
         dump: false,
+        serve: false,
+        port: None,
         db: None,
     };
-    let mut iter = std::env::args().skip(1);
+    let mut iter = std::env::args().skip(1).peekable();
     while let Some(argument) = iter.next() {
         match argument.as_str() {
             "--dump" => args.dump = true,
+            "--serve" => {
+                args.serve = true;
+                if let Some(next) = iter.peek()
+                    && !next.starts_with('-')
+                {
+                    let port = iter.next().unwrap();
+                    args.port = Some(
+                        port.parse::<u16>()
+                            .map_err(|_| format!("--serve expects a port number, got: {port}"))?,
+                    );
+                }
+            }
+            _ if argument.starts_with("--serve=") => {
+                args.serve = true;
+                let port = &argument["--serve=".len()..];
+                args.port = Some(
+                    port.parse::<u16>()
+                        .map_err(|_| format!("--serve expects a port number, got: {port}"))?,
+                );
+            }
             "--db" => {
                 let path = iter.next().ok_or("--db expects a path")?;
                 args.db = Some(PathBuf::from(path));
@@ -59,21 +88,29 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
+    if args.dump && args.serve {
+        return Err("--dump and --serve cannot be combined".into());
+    }
     Ok(args)
 }
 
 fn print_help() {
+    let version = env!("CARGO_PKG_VERSION");
     println!(
-        "ocsess {}\n\
-         TUI to browse and manage OpenCode sessions.\n\n\
-         USAGE:\n  ocsess [--db PATH] [--dump]\n\n\
-         OPTIONS:\n\
-           --db PATH   OpenCode SQLite database (default: auto-discover)\n\
-           --dump      print sessions as TSV and exit\n\
-           -h, --help  this help\n\
-           -V          version\n\n\
-         Keys: press ? in the TUI",
-        env!("CARGO_PKG_VERSION")
+        "ocsess {version}
+TUI to browse and manage OpenCode sessions.
+
+USAGE:
+  ocsess [--db PATH] [--dump | --serve [PORT]]
+
+OPTIONS:
+  --db PATH       OpenCode SQLite database (default: auto-discover)
+  --dump          print sessions as TSV and exit
+  --serve [PORT]  read-only web view on 127.0.0.1 (default port 8765)
+  -h, --help      this help
+  -V              version
+
+Keys: press ? in the TUI"
     );
 }
 

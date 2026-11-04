@@ -270,15 +270,7 @@ impl App {
     }
 
     fn apply_active(&mut self) {
-        let online = self.api_online;
-        for session in &mut self.sessions {
-            session.active = online && self.active_ids.contains(&session.id);
-            if online && !session.active {
-                // The service answered, so its active list wins over the
-                // heuristic busy mark derived from the idle timestamp.
-                session.time_busy = None;
-            }
-        }
+        db::apply_active(&mut self.sessions, &self.active_ids, self.api_online);
     }
 
     pub fn tick(&mut self) {

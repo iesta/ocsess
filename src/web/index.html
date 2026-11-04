@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ocsess</title>
+<style>
+:root{
+  --bg:#111; --panel:#1a1a1a; --line:#2a2a2a; --text:#ddd; --dim:#888;
+  --cyan:#3ddbd9; --green:#5ee08a; --blue:#7aa2f7; --magenta:#d18ee2;
+  --yellow:#e0c46c; --red:#f07178; --orange:#ff9e64;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--bg);color:var(--text);display:flex;flex-direction:column;
+  font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+header{
+  display:flex;gap:12px;align-items:center;padding:8px 12px;
+  border-bottom:1px solid var(--line);flex-wrap:wrap;
+}
+h1{font-size:14px;margin:0;color:var(--cyan);letter-spacing:.08em}
+header .meta{color:var(--dim)}
+header input[type=search]{
+  margin-left:auto;background:var(--panel);border:1px solid var(--line);
+  color:var(--text);padding:4px 8px;border-radius:4px;min-width:180px;
+}
+header label{color:var(--dim);display:flex;gap:4px;align-items:center}
+.live{width:8px;height:8px;border-radius:50%;background:var(--dim);display:inline-block}
+.live.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.live.off{background:var(--red)}
+#error{
+  margin:0;padding:6px 12px;background:#2a1517;color:var(--red);
+  border-bottom:1px solid var(--line);
+}
+main{flex:1;min-height:0;display:flex;flex-direction:column}
+.table-wrap{flex:1;min-height:0;overflow:auto}
+table{border-collapse:collapse;width:100%;white-space:nowrap}
+th,td{
+  text-align:left;padding:4px 10px;border-bottom:1px solid var(--line);
+  overflow:hidden;text-overflow:ellipsis;max-width:32ch;
+}
+th{
+  position:sticky;top:0;background:var(--panel);color:var(--dim);
+  font-weight:600;cursor:pointer;user-select:none;z-index:1;
+}
+th.right,td.right{text-align:right}
+th.asc::after{content:" ▲";color:var(--yellow)}
+th.desc::after{content:" ▼";color:var(--yellow)}
+tbody tr:hover{background:#1e1e1e}
+tbody tr.selected{background:#232323;outline:1px solid var(--cyan);outline-offset:-1px}
+td.state{font-weight:600}
+td.state.running{color:var(--green)}
+td.state.suspended{color:var(--blue)}
+td.state.idle{color:var(--dim)}
+td.state.new{color:#666}
+td.state.archived{color:var(--magenta)}
+td.title{font-weight:600}
+#empty{padding:20px;color:var(--dim);text-align:center}
+dialog{
+  background:var(--panel);color:var(--text);border:1px solid var(--cyan);
+  border-radius:6px;max-width:96vw;width:1100px;max-height:90vh;padding:0;
+}
+dialog::backdrop{background:#000a}
+.detail-head{
+  display:flex;align-items:center;gap:12px;padding:8px 12px;
+  border-bottom:1px solid var(--line);position:sticky;top:0;
+  background:var(--panel);z-index:2;
+}
+.detail-head h2{
+  font-size:13px;margin:0;color:var(--cyan);flex:1;
+  overflow:hidden;text-overflow:ellipsis;
+}
+.detail-head button{
+  background:transparent;border:1px solid var(--line);color:var(--text);
+  border-radius:4px;padding:2px 8px;cursor:pointer;
+}
+.detail-summary{padding:8px 12px;border-bottom:1px solid var(--line);color:var(--dim)}
+.detail-body{overflow:auto;max-height:calc(90vh - 80px)}
+.detail-body table{font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>ocsess</h1>
+  <span class="live" id="live" title="API status"></span>
+  <span class="meta" id="count">0 sessions</span>
+  <span class="meta" id="updated"></span>
+  <input id="search" type="search" placeholder="search title, project, directory…" autocomplete="off">
+  <label><input id="archived" type="checkbox"> archived</label>
+</header>
+<p id="error" hidden></p>
+<main>
+  <div class="table-wrap" id="table-wrap">
+    <table>
+      <thead><tr id="head"></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p id="empty" hidden>No sessions match.</p>
+  </div>
+</main>
+<dialog id="detail">
+  <div class="detail-head">
+    <h2 id="detail-title">Session detail</h2>
+    <span class="meta" id="detail-meta"></span>
+    <button id="detail-close" type="button">close</button>
+  </div>
+  <div class="detail-summary" id="detail-summary"></div>
+  <div class="detail-body" id="detail-body"></div>
+</dialog>
+<script>
+const COLUMNS = [
+  {key:"state", label:"State", sortKey:"state_rank"},
+  {key:"title", label:"Title", sortKey:"title"},
+  {key:"project", label:"Project", sortKey:"project"},
+  {key:"agent", label:"Agent", sortKey:"agent"},
+  {key:"model", label:"Model", sortKey:"model"},
+  {key:"cost_display", label:"Cost", sortKey:"cost", right:true, desc:true},
+  {key:"tokens_display", label:"Tokens", sortKey:"tokens", right:true, desc:true},
+  {key:"messages", label:"Msgs", sortKey:"messages", right:true, desc:true},
+  {key:"updated_display", label:"Updated", sortKey:"time_updated", right:true, desc:true}
+];
+const CALL_COLUMNS = [
+  {key:"created_display", label:"Time (UTC)"},
+  {key:"model", label:"Model"},
+  {key:"cost_display", label:"Cost", right:true},
+  {key:"tokens_input", label:"In", right:true},
+  {key:"tokens_output", label:"Out", right:true},
+  {key:"tokens_cache_read", label:"Cache", right:true},
+  {key:"duration_display", label:"Dur", right:true},
+  {key:"finish", label:"Finish"},
+  {key:"tools_label", label:"Tools"}
+];
+
+const state = {
+  sessions: [], sort:"time_updated", desc:true, search:"", archived:false,
+  selected:null, lastJson:"", refreshing:false, detailId:null, detailTimer:null
+};
+
+function el(tag, className, text){
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function value(session, key){
+  switch(key){
+    case "state": return session.state || "";
+    case "title": return session.parent_id ? "↳ " + session.title : session.title;
+    default: return session[key] ?? "";
+  }
+}
+function compare(a, b, key){
+  if (key === "state_rank") return (a.state_rank || 0) - (b.state_rank || 0);
+  const left = a[key], right = b[key];
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  return String(left ?? "").localeCompare(String(right ?? ""));
+}
+function filtered(){
+  const query = state.search.trim().toLowerCase();
+  return state.sessions.filter(session => {
+    if (!state.archived && session.time_archived != null) return false;
+    if (!query) return true;
+    return [session.title, session.project, session.directory, session.agent, session.model, session.id]
+      .some(field => String(field ?? "").toLowerCase().includes(query));
+  }).sort((a, b) => {
+    let order = compare(a, b, state.sort);
+    if (state.desc) order = -order;
+    if (order === 0) order = (b.time_updated || 0) - (a.time_updated || 0);
+    return order;
+  });
+}
+function renderHead(){
+  const head = document.getElementById("head");
+  head.replaceChildren();
+  for (const column of COLUMNS){
+    const th = el("th", column.right ? "right" : "", column.label);
+    if (state.sort === column.sortKey) th.classList.add(state.desc ? "desc" : "asc");
+    th.addEventListener("click", () => {
+      if (state.sort === column.sortKey) {
+        state.desc = !state.desc;
+      } else {
+        // Match the TUI: numbers and timestamps open newest/largest first,
+        // text and state open in reading order.
+        state.sort = column.sortKey;
+        state.desc = column.desc === true;
+      }
+      render();
+    });
+    head.append(th);
+  }
+}
+function renderRows(){
+  const wrap = document.getElementById("table-wrap");
+  const scroll = wrap.scrollTop;
+  const tbody = document.getElementById("rows");
+  tbody.replaceChildren();
+  const rows = filtered();
+  document.getElementById("count").textContent =
+    rows.length + " / " + state.sessions.length + " sessions";
+  document.getElementById("empty").hidden = rows.length > 0;
+  for (const session of rows){
+    const tr = el("tr");
+    tr.dataset.id = session.id;
+    if (session.id === state.selected) tr.classList.add("selected");
+    for (const column of COLUMNS){
+      const cell = el("td", column.right ? "right" : "");
+      if (column.key === "state"){
+        cell.className = "state " + (session.state || "new");
+        cell.textContent = (session.state_symbol || "") + " " + (session.state || "");
+      } else if (column.key === "title"){
+        cell.className = "title";
+        cell.textContent = value(session, "title");
+        cell.title = session.directory || "";
+      } else {
+        cell.textContent = value(session, column.key);
+      }
+      tr.append(cell);
+    }
+    tr.addEventListener("click", () => openDetail(session.id));
+    tbody.append(tr);
+  }
+  wrap.scrollTop = scroll;
+}
+function render(){
+  renderHead();
+  renderRows();
+}
+async function refresh(){
+  if (state.refreshing) return;
+  state.refreshing = true;
+  try {
+    const response = await fetch("/api/sessions", {cache:"no-store"});
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const text = await response.text();
+    if (text === state.lastJson) return;
+    const data = JSON.parse(text);
+    state.lastJson = text;
+    state.sessions = data.sessions || [];
+    const live = document.getElementById("live");
+    live.className = "live " + (data.api_online ? "on" : "off");
+    live.title = data.api_online ? "OpenCode API online" : "OpenCode API offline";
+    document.getElementById("updated").textContent =
+      data.updated_at ? "updated " + new Date(data.updated_at).toLocaleTimeString() : "";
+    const error = document.getElementById("error");
+    if (data.error){
+      error.hidden = false;
+      error.textContent = data.error;
+    } else {
+      error.hidden = true;
+      error.textContent = "";
+    }
+    render();
+  } catch (problem){
+    document.getElementById("live").className = "live off";
+    const error = document.getElementById("error");
+    error.hidden = false;
+    error.textContent = "connection lost · " + problem;
+  } finally {
+    state.refreshing = false;
+  }
+}
+function summaryLine(summary){
+  return summary.calls + " calls · " + (summary.cost_display || "—") + " total · " +
+    (summary.avg_cost_display || "—") + " avg · " + summary.tools + " tools · " +
+    summary.errors + " errors · tokens in " + summary.tokens_input.toLocaleString() +
+    " · out " + summary.tokens_output.toLocaleString() +
+    " · reasoning " + summary.tokens_reasoning.toLocaleString() +
+    " · cache " + summary.cache_read.toLocaleString() + "/" + summary.cache_write.toLocaleString();
+}
+function renderDetail(data){
+  document.getElementById("detail-title").textContent = "Detail · " + data.session_id;
+  document.getElementById("detail-summary").textContent = summaryLine(data.summary);
+  document.getElementById("detail-meta").textContent =
+    "updated " + new Date(data.updated_at).toLocaleTimeString();
+  const body = document.getElementById("detail-body");
+  body.replaceChildren();
+  const table = el("table");
+  const head = el("thead");
+  const headRow = el("tr");
+  for (const column of CALL_COLUMNS){
+    headRow.append(el("th", column.right ? "right" : "", column.label));
+  }
+  head.append(headRow);
+  const tbody = el("tbody");
+  for (const call of data.calls || []){
+    const tr = el("tr");
+    for (const column of CALL_COLUMNS){
+      tr.append(el("td", column.right ? "right" : "", call[column.key] ?? "—"));
+    }
+    tbody.append(tr);
+  }
+  table.append(head, tbody);
+  body.append(table);
+}
+async function refreshDetail(){
+  if (!state.detailId) return;
+  try {
+    const response = await fetch(
+      "/api/sessions/" + encodeURIComponent(state.detailId) + "/calls",
+      {cache:"no-store"}
+    );
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    renderDetail(await response.json());
+  } catch (problem){
+    document.getElementById("detail-summary").textContent =
+      "detail unavailable · " + problem;
+  }
+}
+function openDetail(id){
+  state.detailId = id;
+  state.selected = id;
+  const dialog = document.getElementById("detail");
+  if (!dialog.open) dialog.showModal();
+  renderRows();
+  refreshDetail();
+  clearInterval(state.detailTimer);
+  state.detailTimer = setInterval(() => {
+    if (!document.hidden) refreshDetail();
+  }, 2000);
+}
+function closeDetail(){
+  const dialog = document.getElementById("detail");
+  if (dialog.open) dialog.close();
+}
+document.getElementById("detail-close").addEventListener("click", closeDetail);
+document.getElementById("detail").addEventListener("close", () => {
+  clearInterval(state.detailTimer);
+  state.detailTimer = null;
+  state.detailId = null;
+  state.selected = null;
+  renderRows();
+});
+document.getElementById("search").addEventListener("input", event => {
+  state.search = event.target.value;
+  renderRows();
+});
+document.getElementById("archived").addEventListener("change", event => {
+  state.archived = event.target.checked;
+  renderRows();
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refresh();
+});
+setInterval(() => {
+  if (!document.hidden) refresh();
+}, 1000);
+refresh();
+</script>
+</body>
+</html>
