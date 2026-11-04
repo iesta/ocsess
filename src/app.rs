@@ -213,6 +213,9 @@ impl App {
         match db::load_sessions(&self.db_path) {
             Ok(sessions) => {
                 self.sessions = sessions;
+                // Merge the API's active set before filtering and sorting, so a
+                // `State = running` filter and the sort order see it.
+                self.apply_active();
                 self.refresh(previous);
                 self.last_error = None;
             }
@@ -223,6 +226,7 @@ impl App {
                     }
                     self.last_error = Some(error);
                     self.sessions = sessions;
+                    self.apply_active();
                     self.refresh(previous);
                 }
                 Err(api_error) => {
@@ -231,10 +235,10 @@ impl App {
                         self.notify(message.clone(), true);
                     }
                     self.last_error = Some(message);
+                    self.apply_active();
                 }
             },
         }
-        self.apply_active();
         self.last_reload = Instant::now();
         if let Some(id) = self.select_after.take()
             && let Some(position) = self
@@ -258,6 +262,9 @@ impl App {
             }
             Err(_) => {
                 self.api_online = false;
+                // The last successful answer is not evidence any more: without
+                // this, a session stays "running" after the service goes away.
+                self.active_ids.clear();
             }
         }
     }
@@ -265,7 +272,7 @@ impl App {
     fn apply_active(&mut self) {
         let online = self.api_online;
         for session in &mut self.sessions {
-            session.active = self.active_ids.contains(&session.id);
+            session.active = online && self.active_ids.contains(&session.id);
             if online && !session.active {
                 // The service answered, so its active list wins over the
                 // heuristic busy mark derived from the idle timestamp.
@@ -1235,6 +1242,24 @@ mod tests {
             "unexpected toast: {}",
             toast.text
         );
+    }
+
+    #[test]
+    fn active_set_only_applies_when_online() {
+        let mut app = test_app();
+        app.active_ids.insert("root".into());
+        app.sessions[0].active = true;
+
+        // The service is offline: keep the database state instead of trusting
+        // the last successful active answer.
+        app.api_online = false;
+        app.apply_active();
+        assert!(!app.sessions[0].active);
+
+        app.api_online = true;
+        app.apply_active();
+        assert!(app.sessions[0].active);
+        assert!(!app.sessions[1].active);
     }
 
     #[test]

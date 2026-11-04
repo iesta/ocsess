@@ -162,18 +162,29 @@ impl Api {
     }
 
     fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<Value, String> {
-        match read_service()
-            .and_then(|service| self.request_with(&self.agent, &service, method, path, body))
-        {
-            Ok(value) => Ok(value),
-            Err(ReqErr::Transport(_)) => {
-                self.start_service();
-                let service = read_service().map_err(|error| error.to_string())?;
-                self.request_with(&self.agent, &service, method, path, body)
-                    .map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error.to_string()),
+        match read_service() {
+            Ok(service) => match self.request_with(&self.agent, &service, method, path, body) {
+                Ok(value) => Ok(value),
+                Err(ReqErr::Transport(_)) => self.retry_after_start(method, path, body),
+                Err(error) => Err(error.to_string()),
+            },
+            // A missing or unreadable service file usually means the service is
+            // not running yet, not that the request is invalid. Start it and
+            // retry once; the second read_service() reports the real error.
+            Err(_) => self.retry_after_start(method, path, body),
         }
+    }
+
+    fn retry_after_start(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<Value, String> {
+        self.start_service();
+        let service = read_service().map_err(|error| error.to_string())?;
+        self.request_with(&self.agent, &service, method, path, body)
+            .map_err(|error| error.to_string())
     }
 
     fn request_with(

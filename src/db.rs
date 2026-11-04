@@ -134,7 +134,7 @@ pub fn format_relative(ms: i64) -> String {
     const MINUTE: i64 = 60_000;
     const HOUR: i64 = 60 * MINUTE;
     const DAY: i64 = 24 * HOUR;
-    if diff < 45_000 {
+    if diff < MINUTE {
         "now".to_string()
     } else if diff < HOUR {
         format!("{}m", diff / MINUTE)
@@ -195,7 +195,13 @@ pub fn format_tokens(tokens: i64) -> String {
     } else if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
+        let thousands = tokens as f64 / 1_000.0;
+        // 999_999 must round up to 1.0M, not print "1000.0k".
+        if thousands >= 999.95 {
+            "1.0M".to_string()
+        } else {
+            format!("{thousands:.1}k")
+        }
     } else {
         tokens.to_string()
     }
@@ -752,9 +758,19 @@ mod tests {
     }
 
     #[test]
+    fn relative_formats() {
+        let now = now_ms();
+        assert_eq!(format_relative(now - 45_000), "now");
+        assert_eq!(format_relative(now - 59_999), "now");
+        assert_eq!(format_relative(now - 60_000), "1m");
+        assert_eq!(format_relative(now - 3_600_000), "1h");
+    }
+
+    #[test]
     fn compact_formats() {
         assert_eq!(format_tokens(999), "999");
         assert_eq!(format_tokens(1_500), "1.5k");
+        assert_eq!(format_tokens(999_999), "1.0M");
         assert_eq!(format_cost(0.0), "—");
         assert_eq!(format_cost(0.0026), "$0.0026");
     }
