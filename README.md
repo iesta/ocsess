@@ -24,7 +24,7 @@ Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Intel, Apple Silicon):
 curl -sSfL https://raw.githubusercontent.com/iesta/ocsess/main/install.sh | sh
 ```
 
-The script installs to `~/.local/bin`; set `OCSESS_INSTALL_DIR` to change that and `OCSESS_VERSION=v0.2.1` to pin a release. It verifies the SHA256 sum before installing.
+The script installs to `~/.local/bin`; set `OCSESS_INSTALL_DIR` to change that and `OCSESS_VERSION=v0.3.0` to pin a release. It verifies the SHA256 sum before installing.
 
 From source, with Rust 1.89+:
 
