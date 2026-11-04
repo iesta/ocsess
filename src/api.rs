@@ -15,7 +15,7 @@ use flate2::write::GzEncoder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::db::{Session, now_ms};
+use crate::db::{Session, derive_busy};
 
 const SERVICE_USER: &str = "opencode";
 
@@ -70,22 +70,14 @@ impl Api {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>, String> {
-        let mut sessions = Vec::new();
-        for archived in [false, true] {
-            let path = format!("/api/session?limit=1000&order=desc&archived={archived}");
-            let value = self.request_quiet("GET", &path, None)?;
-            let Some(items) = value.get("data").and_then(Value::as_array) else {
-                continue;
-            };
-            for item in items {
-                if let Some(session) = session_from_api(item, archived) {
-                    sessions.push(session);
-                }
-            }
-        }
-        sessions.sort_by_key(|session| session.time_updated);
-        sessions.dedup_by(|left, right| left.id == right.id);
-        Ok(sessions)
+        let value = self.request_quiet("GET", "/api/session?limit=1000&order=desc", None)?;
+        let Some(items) = value.get("data").and_then(Value::as_array) else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .filter_map(session_from_api)
+            .collect::<Vec<Session>>())
     }
 
     pub fn active_sessions(&self) -> Result<HashSet<String>, String> {
@@ -94,6 +86,22 @@ impl Api {
             return Ok(HashSet::new());
         };
         Ok(data.keys().cloned().collect())
+    }
+
+    /// OpenCode v2 has no write path for archiving: there is no endpoint, and
+    /// `PATCH /api/session/{id}` accepts `archived` then ignores it. Ask the
+    /// server for its version once so the UI can hide keys that cannot work
+    /// instead of offering them and failing. Unknown (service offline) is
+    /// treated as supported, and `set_archived` still verifies the result.
+    pub fn supports_archive(&self) -> bool {
+        let Ok(value) = self.request_quiet("GET", "/api/info", None) else {
+            return true;
+        };
+        value
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(major_version)
+            .is_none_or(|major| major <= 1)
     }
 
     pub fn fork(&self, id: &str) -> Result<String, String> {
@@ -119,6 +127,21 @@ impl Api {
     pub fn set_archived(&self, id: &str, archived: bool) -> Result<(), String> {
         let body = json!({ "archived": archived }).to_string();
         self.request("PATCH", &format!("/api/session/{id}"), Some(&body))?;
+        // Some builds accept the field and silently ignore it, so confirm the
+        // change took effect before telling the user it worked.
+        let value = self.request_quiet("GET", &format!("/api/session/{id}"), None)?;
+        let stored = value
+            .get("data")
+            .and_then(|data| data.get("time"))
+            .and_then(|time| time.get("archived"))
+            .is_some_and(|archived| !archived.is_null());
+        if stored != archived {
+            return Err(if archived {
+                "this OpenCode version ignores session archiving · use delete instead".to_string()
+            } else {
+                "this OpenCode version ignores session archiving".to_string()
+            });
+        }
         Ok(())
     }
 
@@ -227,28 +250,40 @@ fn read_service() -> Result<Service, ReqErr> {
     })
 }
 
-fn session_from_api(item: &Value, archived: bool) -> Option<Session> {
+fn major_version(version: &str) -> Option<u32> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+}
+
+fn session_from_api(item: &Value) -> Option<Session> {
     let id = item.get("id")?.as_str()?.to_string();
     let directory = item
         .get("location")
         .and_then(|location| location.get("directory"))
+        .or_else(|| item.get("directory"))
+        .or_else(|| item.get("path").and_then(|path| path.get("cwd")))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     let time = item.get("time").cloned().unwrap_or(Value::Null);
     let tokens = item.get("tokens").cloned().unwrap_or(Value::Null);
     let cache = tokens.get("cache").cloned().unwrap_or(Value::Null);
-    let archived_at = time.get("archived").and_then(Value::as_i64).or_else(|| {
-        if archived {
-            Some(
-                time.get("updated")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_else(now_ms),
-            )
-        } else {
-            None
-        }
-    });
+    let model = item
+        .get("model")
+        .and_then(|model| {
+            model
+                .get("id")
+                .or_else(|| model.get("modelID"))
+                .and_then(Value::as_str)
+                .or_else(|| model.as_str())
+        })
+        .map(str::to_string);
+    let updated = time.get("updated").and_then(Value::as_i64).unwrap_or(0);
+    let idle = time.get("idle").and_then(Value::as_i64);
     Some(Session {
         id,
         parent_id: item
@@ -269,11 +304,7 @@ fn session_from_api(item: &Value, archived: bool) -> Option<Session> {
             .get("agent")
             .and_then(Value::as_str)
             .map(str::to_string),
-        model: item
-            .get("model")
-            .and_then(|model| model.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        model,
         cost: item.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
         tokens_input: tokens.get("input").and_then(Value::as_i64).unwrap_or(0),
         tokens_output: tokens.get("output").and_then(Value::as_i64).unwrap_or(0),
@@ -283,10 +314,13 @@ fn session_from_api(item: &Value, archived: bool) -> Option<Session> {
         messages: 0,
         active: false,
         time_created: time.get("created").and_then(Value::as_i64).unwrap_or(0),
-        time_updated: time.get("updated").and_then(Value::as_i64).unwrap_or(0),
-        time_archived: archived_at,
-        time_busy: time.get("busy").and_then(Value::as_i64),
-        time_idle: time.get("idle").and_then(Value::as_i64),
+        time_updated: updated,
+        time_archived: time.get("archived").and_then(Value::as_i64),
+        time_busy: time
+            .get("busy")
+            .and_then(Value::as_i64)
+            .or_else(|| derive_busy(updated, idle)),
+        time_idle: idle,
         time_suspended: time.get("suspended").and_then(Value::as_i64),
         outcome: item
             .get("outcome")
@@ -495,5 +529,89 @@ fn failure(error: String) -> WorkerEvent {
         error: true,
         reload: false,
         select: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Status;
+
+    // Shape returned by the OpenCode v2 service: no `time.busy`, directory
+    // under `location`, model as an object.
+    fn v2_payload(updated: i64, idle: i64) -> serde_json::Value {
+        json!({
+            "id": "ses_v2",
+            "projectID": "proj",
+            "agent": "build",
+            "model": {"id": "deepseek/deepseek-v4.1", "providerID": "openrouter", "variant": "high"},
+            "cost": 0.25,
+            "tokens": {"input": 100, "output": 20, "reasoning": 5, "cache": {"read": 300, "write": 7}},
+            "outcome": "succeeded",
+            "time": {"created": 1, "updated": updated, "idle": idle, "viewed": idle},
+            "title": "Directory review",
+            "location": {"directory": "/home/jm/dev/ocsess"}
+        })
+    }
+
+    // Shape returned by older services: flat directory, model as a plain
+    // string, archived sessions flagged with `time.archived`.
+    const V1: &str = r#"{
+        "id": "ses_v1",
+        "directory": "/home/jm/dev/old",
+        "model": "~deepseek/deepseek-v4-flash-latest",
+        "time": {"created": 1, "updated": 2, "archived": 3},
+        "title": "Old session"
+    }"#;
+
+    fn parse(item: &serde_json::Value) -> Session {
+        session_from_api(item).unwrap()
+    }
+
+    #[test]
+    fn parses_v2_session() {
+        let now = crate::db::now_ms();
+        let session = parse(&v2_payload(now - 1_000, now - 2_000));
+        assert_eq!(session.id, "ses_v2");
+        assert_eq!(session.directory, "/home/jm/dev/ocsess");
+        assert_eq!(session.project, "ocsess");
+        assert_eq!(session.model.as_deref(), Some("deepseek/deepseek-v4.1"));
+        assert_eq!(session.tokens_cache_read, 300);
+        assert_eq!(session.tokens_cache_write, 7);
+        assert_eq!(session.time_archived, None);
+        // v2 has no time.busy, so it comes from updated > idle.
+        assert_eq!(session.time_busy, Some(now - 1_000));
+        assert_eq!(session.status(), Status::Running);
+        assert_eq!(session.outcome.as_deref(), Some("succeeded"));
+    }
+
+    #[test]
+    fn old_update_is_not_running() {
+        let now = crate::db::now_ms();
+        let session = parse(&v2_payload(now - 900_000, now - 1_000_000));
+        assert_eq!(session.time_busy, None);
+        assert_eq!(session.status(), Status::Idle);
+    }
+
+    #[test]
+    fn parses_legacy_session() {
+        let session = parse(&serde_json::from_str(V1).unwrap());
+        assert_eq!(session.directory, "/home/jm/dev/old");
+        assert_eq!(session.project, "old");
+        assert_eq!(
+            session.model.as_deref(),
+            Some("~deepseek/deepseek-v4-flash-latest")
+        );
+        assert_eq!(session.time_archived, Some(3));
+        assert_eq!(session.status(), Status::Archived);
+        assert_eq!(session.time_busy, None);
+    }
+
+    #[test]
+    fn version_major_parses() {
+        assert_eq!(major_version("2.0.19"), Some(2));
+        assert_eq!(major_version("v1.14.2"), Some(1));
+        assert_eq!(major_version(" 3.1 "), Some(3));
+        assert_eq!(major_version("dev"), None);
     }
 }

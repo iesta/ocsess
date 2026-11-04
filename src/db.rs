@@ -114,6 +114,18 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// A session that has updated after its idle mark is working again. Bounded in
+/// time because a session killed mid-run never writes a newer idle mark and
+/// would otherwise look busy forever.
+pub const BUSY_WINDOW_MS: i64 = 15 * 60 * 1000;
+
+/// OpenCode v2 dropped `time.busy` from both the database and the API, so
+/// derive it from the idle mark instead.
+pub fn derive_busy(updated: i64, idle: Option<i64>) -> Option<i64> {
+    let idle = idle?;
+    (updated > idle && updated > now_ms() - BUSY_WINDOW_MS).then_some(updated)
+}
+
 pub fn format_relative(ms: i64) -> String {
     if ms <= 0 {
         return "—".to_string();
@@ -234,22 +246,130 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// OpenCode v1 keeps sessions in `session` with messages in `message`/`part`;
+/// v2 moved them to `session_v2` with `session_message`. Detect what this
+/// database has instead of assuming one layout, so both versions load.
+struct Schema {
+    sessions: &'static str,
+    messages: &'static str,
+    session_columns: Vec<String>,
+    parts: bool,
+}
+
+impl Schema {
+    fn detect(conn: &Connection) -> Result<Self, String> {
+        let objects = object_names(conn)?;
+        let pick = |candidates: [&'static str; 2]| {
+            candidates
+                .into_iter()
+                .find(|name| objects.iter().any(|object| object == name))
+        };
+        let sessions = pick(["session_v2", "session"]).ok_or_else(|| {
+            "no session table in this database (expected session_v2 or session)".to_string()
+        })?;
+        let messages = pick(["session_message", "message"]).ok_or_else(|| {
+            "no message table in this database (expected session_message or message)".to_string()
+        })?;
+        Ok(Self {
+            sessions,
+            messages,
+            session_columns: columns(conn, sessions)?,
+            parts: objects.iter().any(|object| object == "part"),
+        })
+    }
+
+    fn has(&self, column: &str) -> bool {
+        self.session_columns.iter().any(|name| name == column)
+    }
+
+    /// Column reference, or `NULL` when this OpenCode schema does not have it.
+    fn col(&self, column: &str) -> String {
+        if self.has(column) {
+            format!("s.{column}")
+        } else {
+            "NULL".to_string()
+        }
+    }
+}
+
+fn object_names(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+        .map_err(|e| format!("read schema: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("read schema: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read schema: {e}"))
+}
+
+fn columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| format!("read {table} columns: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("read {table} columns: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read {table} columns: {e}"))
+}
+
+/// v2 dropped `time_busy`. A session that has updated past its idle mark is
+/// working; the API's active list overrides this when the service is reachable.
+fn busy_expr(schema: &Schema) -> String {
+    if schema.has("time_busy") {
+        "s.time_busy".to_string()
+    } else if schema.has("time_idle") {
+        format!(
+            "CASE WHEN s.time_updated > s.time_idle AND s.time_updated > {} \
+             THEN s.time_updated END",
+            now_ms() - BUSY_WINDOW_MS
+        )
+    } else {
+        "NULL".to_string()
+    }
+}
+
 pub fn load_sessions(path: &Path) -> Result<Vec<Session>, String> {
     let conn = open_db(path)?;
+    query_sessions(&conn)
+}
 
-    let sql = "
-        SELECT s.id, s.parent_id, COALESCE(p.name, ''),
-               s.directory, s.title, s.agent, s.model, s.cost,
-               s.tokens_input, s.tokens_output, s.tokens_reasoning,
-               s.tokens_cache_read, s.tokens_cache_write,
-               s.time_created, s.time_updated, s.time_archived,
-               s.time_busy, s.time_idle, s.time_suspended, s.idle_outcome,
-               (SELECT COUNT(*) FROM session_message m WHERE m.session_id = s.id)
-        FROM session_v2 s
-        LEFT JOIN project p ON p.id = s.project_id
-    ";
+fn query_sessions(conn: &Connection) -> Result<Vec<Session>, String> {
+    let schema = Schema::detect(conn)?;
+    let selects = [
+        "s.id".to_string(),
+        schema.col("parent_id"),
+        "COALESCE(p.name, '')".to_string(),
+        "s.directory".to_string(),
+        schema.col("title"),
+        schema.col("agent"),
+        schema.col("model"),
+        schema.col("cost"),
+        schema.col("tokens_input"),
+        schema.col("tokens_output"),
+        schema.col("tokens_reasoning"),
+        schema.col("tokens_cache_read"),
+        schema.col("tokens_cache_write"),
+        schema.col("time_created"),
+        schema.col("time_updated"),
+        schema.col("time_archived"),
+        busy_expr(&schema),
+        schema.col("time_idle"),
+        schema.col("time_suspended"),
+        schema.col("idle_outcome"),
+        format!(
+            "(SELECT COUNT(*) FROM {} m WHERE m.session_id = s.id)",
+            schema.messages
+        ),
+    ];
+    let sql = format!(
+        "SELECT {}\n        FROM {} s\n        LEFT JOIN project p ON p.id = s.project_id",
+        selects.join(", "),
+        schema.sessions
+    );
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|e| format!("query sessions: {e}"))?;
     let rows = stmt
         .query_map([], |row| {
@@ -274,14 +394,14 @@ pub fn load_sessions(path: &Path) -> Result<Vec<Session>, String> {
                     .unwrap_or_else(|| "(untitled)".into()),
                 agent: row.get(5)?,
                 model: parse_model(raw_model),
-                cost: row.get(7)?,
-                tokens_input: row.get(8)?,
-                tokens_output: row.get(9)?,
-                tokens_reasoning: row.get(10)?,
-                tokens_cache_read: row.get(11)?,
-                tokens_cache_write: row.get(12)?,
-                time_created: row.get(13)?,
-                time_updated: row.get(14)?,
+                cost: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                tokens_input: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                tokens_output: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                tokens_reasoning: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                tokens_cache_read: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                tokens_cache_write: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                time_created: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                time_updated: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
                 time_archived: row.get(15)?,
                 time_busy: row.get(16)?,
                 time_idle: row.get(17)?,
@@ -305,6 +425,7 @@ fn parse_model(raw: Option<String>) -> Option<String> {
     let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     value
         .get("id")
+        .or_else(|| value.get("modelID"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .or(Some(raw))
@@ -414,10 +535,47 @@ pub fn summarize(calls: &[Call]) -> CallSummary {
 
 pub fn load_calls(path: &Path, session_id: &str) -> Result<Vec<Call>, String> {
     let conn = open_db(path)?;
-    let sql = "
-        SELECT m.id, m.time_created,
-               json_extract(m.data, '$.time.streamed'),
-               json_extract(m.data, '$.model.id'),
+    query_calls(&conn, session_id)
+}
+
+fn query_calls(conn: &Connection, session_id: &str) -> Result<Vec<Call>, String> {
+    let schema = Schema::detect(conn)?;
+    let modern = schema.messages == "session_message";
+    let role_filter = if modern {
+        "m.type = 'assistant'"
+    } else {
+        "json_extract(m.data, '$.role') = 'assistant'"
+    };
+    let tools_expr = if modern {
+        "COALESCE((
+             SELECT json_group_array(json_object(
+                 'name', json_extract(p.value, '$.name'),
+                 'status', json_extract(p.value, '$.state.status')
+             ))
+             FROM json_each(m.data, '$.content') p
+             WHERE json_extract(p.value, '$.type') = 'tool'
+         ), '[]')"
+            .to_string()
+    } else if schema.parts {
+        "COALESCE((
+             SELECT json_group_array(json_object(
+                 'name', json_extract(pt.data, '$.tool'),
+                 'status', json_extract(pt.data, '$.state.status')
+             ))
+             FROM part pt
+             WHERE pt.message_id = m.id AND json_extract(pt.data, '$.type') = 'tool'
+         ), '[]')"
+            .to_string()
+    } else {
+        "'[]'".to_string()
+    };
+    let sql = format!(
+        "SELECT m.id, m.time_created,
+               COALESCE(json_extract(m.data, '$.time.streamed'),
+                        json_extract(m.data, '$.time.completed')),
+               COALESCE(json_extract(m.data, '$.model.id'),
+                        json_extract(m.data, '$.model.modelID'),
+                        json_extract(m.data, '$.modelID')),
                json_extract(m.data, '$.cost'),
                json_extract(m.data, '$.tokens.input'),
                json_extract(m.data, '$.tokens.output'),
@@ -425,19 +583,15 @@ pub fn load_calls(path: &Path, session_id: &str) -> Result<Vec<Call>, String> {
                json_extract(m.data, '$.tokens.cache.read'),
                json_extract(m.data, '$.tokens.cache.write'),
                json_extract(m.data, '$.finish'),
-               COALESCE((
-                   SELECT json_group_array(json_object(
-                       'name', json_extract(p.value, '$.name'),
-                       'status', json_extract(p.value, '$.state.status')
-                   ))
-                   FROM json_each(m.data, '$.content') p
-                   WHERE json_extract(p.value, '$.type') = 'tool'
-               ), '[]')
-        FROM session_message m
-        WHERE m.session_id = ?1 AND m.type = 'assistant'
-        ORDER BY m.time_created DESC, m.id DESC
-    ";
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("query calls: {e}"))?;
+               {tools_expr}
+        FROM {} m
+        WHERE m.session_id = ?1 AND {role_filter}
+        ORDER BY m.time_created DESC, m.id DESC",
+        schema.messages
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("query calls: {e}"))?;
     let rows = stmt
         .query_map([session_id], |row| {
             let tools_json: String = row.get(11)?;
@@ -603,5 +757,223 @@ mod tests {
         assert_eq!(format_tokens(1_500), "1.5k");
         assert_eq!(format_cost(0.0), "—");
         assert_eq!(format_cost(0.0026), "$0.0026");
+    }
+
+    fn create_v2(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE project (id text primary key, name text);
+             CREATE TABLE session_v2 (
+                 id text primary key, project_id text not null, parent_id text,
+                 slug text not null, directory text not null, title text,
+                 version text not null, cost real not null default 0,
+                 tokens_input integer not null default 0,
+                 tokens_output integer not null default 0,
+                 tokens_reasoning integer not null default 0,
+                 tokens_cache_read integer not null default 0,
+                 tokens_cache_write integer not null default 0,
+                 agent text, model text,
+                 time_created integer not null, time_updated integer not null,
+                 time_archived integer, time_suspended integer, time_idle integer,
+                 idle_outcome text);
+             CREATE TABLE session_message (
+                 id text primary key, session_id text not null, type text not null,
+                 seq integer not null, time_created integer not null,
+                 time_updated integer not null, data text not null);",
+        )
+        .unwrap();
+    }
+
+    fn create_v1(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE project (id text primary key, name text);
+             CREATE TABLE session (
+                 id text primary key, project_id text not null, parent_id text,
+                 slug text not null, directory text not null, title text not null,
+                 version text not null, cost real not null default 0,
+                 tokens_input integer not null default 0,
+                 tokens_output integer not null default 0,
+                 tokens_reasoning integer not null default 0,
+                 tokens_cache_read integer not null default 0,
+                 tokens_cache_write integer not null default 0,
+                 agent text, model text,
+                 time_created integer not null, time_updated integer not null,
+                 time_archived integer);
+             CREATE TABLE message (
+                 id text primary key, session_id text not null,
+                 time_created integer not null, time_updated integer not null,
+                 data text not null);
+             CREATE TABLE part (
+                 id text primary key, message_id text not null, session_id text not null,
+                 time_created integer not null, time_updated integer not null,
+                 data text not null);",
+        )
+        .unwrap();
+    }
+
+    fn insert_session(conn: &Connection, sql: &str) {
+        conn.execute(sql, []).unwrap();
+    }
+
+    #[test]
+    fn reads_v2_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v2(&conn);
+        let now = now_ms();
+        insert_session(
+            &conn,
+            "INSERT INTO project (id, name) VALUES ('p1', 'proj')",
+        );
+        insert_session(
+            &conn,
+            &format!(
+                "INSERT INTO session_v2
+                    (id, project_id, slug, directory, title, version, cost, model,
+                     time_created, time_updated, time_idle)
+                 VALUES ('ses_busy', 'p1', 'slug', '/tmp/busy', 'Busy', '2', 0.5,
+                         '{{\"id\":\"m1\"}}', {a}, {b}, {c})",
+                a = now - 3_000,
+                b = now - 1_000,
+                c = now - 2_000
+            ),
+        );
+        insert_session(
+            &conn,
+            &format!(
+                "INSERT INTO session_v2
+                    (id, project_id, slug, directory, title, version, time_created,
+                     time_updated, time_idle, idle_outcome)
+                 VALUES ('ses_idle', 'p1', 'slug', '/tmp/idle', 'Idle', '2',
+                         {a}, {b}, {c}, 'succeeded')",
+                a = now - 5_000,
+                b = now - 4_000,
+                c = now - 1_000
+            ),
+        );
+        insert_session(
+            &conn,
+            &format!(
+                "INSERT INTO session_v2
+                    (id, project_id, slug, directory, title, version, time_created,
+                     time_updated, time_idle, time_archived)
+                 VALUES ('ses_arch', 'p1', 'slug', '/tmp/arch', 'Arch', '2',
+                         {a}, {b}, {c}, {d})",
+                a = now - 5_000,
+                b = now - 4_000,
+                c = now - 1_000,
+                d = now - 500
+            ),
+        );
+        // A session killed mid-run: newer update, but far outside the busy window.
+        insert_session(
+            &conn,
+            &format!(
+                "INSERT INTO session_v2
+                    (id, project_id, slug, directory, title, version, time_created,
+                     time_updated, time_idle)
+                 VALUES ('ses_stale', 'p1', 'slug', '/tmp/stale', 'Stale', '2',
+                         {a}, {b}, {c})",
+                a = now - 1_500_000,
+                b = now - 1_200_000,
+                c = now - 1_300_000
+            ),
+        );
+        insert_session(
+            &conn,
+            r#"INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+               VALUES ('msg_1', 'ses_busy', 'assistant', 1, 1000, 2000,
+                       '{"time":{"streamed":4000},"model":{"id":"m1"},"cost":0.25,
+                         "tokens":{"input":10,"output":5,"reasoning":2,"cache":{"read":7,"write":0}},
+                         "finish":"tool-calls",
+                         "content":[{"type":"tool","name":"shell","state":{"status":"error"}}]}')"#,
+        );
+
+        let sessions = query_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 4);
+        let busy = sessions.iter().find(|s| s.id == "ses_busy").unwrap();
+        assert_eq!(
+            busy.status(),
+            Status::Running,
+            "updated past idle means busy"
+        );
+        assert_eq!(busy.messages, 1);
+        assert_eq!(busy.project, "proj");
+        assert_eq!(busy.model.as_deref(), Some("m1"));
+        let idle = sessions.iter().find(|s| s.id == "ses_idle").unwrap();
+        assert_eq!(idle.status(), Status::Idle);
+        assert_eq!(idle.outcome.as_deref(), Some("succeeded"));
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.id == "ses_arch")
+                .unwrap()
+                .status(),
+            Status::Archived
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.id == "ses_stale")
+                .unwrap()
+                .status(),
+            Status::Idle,
+            "an old update past idle is not running any more"
+        );
+
+        let calls = query_calls(&conn, "ses_busy").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].duration_ms(), Some(3_000));
+        assert_eq!(calls[0].model.as_deref(), Some("m1"));
+        assert_eq!(calls[0].tools_label(), "shell!");
+        assert_eq!(calls[0].tokens_cache_read, 7);
+    }
+
+    #[test]
+    fn reads_v1_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v1(&conn);
+        insert_session(
+            &conn,
+            "INSERT INTO project (id, name) VALUES ('p1', 'proj')",
+        );
+        insert_session(
+            &conn,
+            "INSERT INTO session
+                (id, project_id, slug, directory, title, version, cost, time_created, time_updated)
+             VALUES ('ses_old', 'p1', 'slug', '/tmp/old', 'Old', '1', 1.5, 10, 20)",
+        );
+        insert_session(
+            &conn,
+            r#"INSERT INTO message (id, session_id, time_created, time_updated, data)
+               VALUES ('msg_1', 'ses_old', 1000, 2000,
+                       '{"role":"assistant","modelID":"m2","cost":0.5,
+                         "tokens":{"input":1,"output":2,"reasoning":3,"cache":{"read":4,"write":5}},
+                         "time":{"created":1000,"completed":3500},"finish":"stop"}')"#,
+        );
+        insert_session(
+            &conn,
+            r#"INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+               VALUES ('prt_1', 'msg_1', 'ses_old', 1000, 2000,
+                       '{"type":"tool","tool":"bash","state":{"status":"completed"}}')"#,
+        );
+
+        let sessions = query_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status(), Status::New);
+        assert_eq!(sessions[0].messages, 1);
+        assert_eq!(sessions[0].cost, 1.5);
+
+        let calls = query_calls(&conn, "ses_old").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].model.as_deref(), Some("m2"));
+        assert_eq!(calls[0].duration_ms(), Some(2_500));
+        assert_eq!(calls[0].tools_label(), "bash");
+        assert_eq!(calls[0].tokens_cache_write, 5);
+    }
+
+    #[test]
+    fn rejects_database_without_sessions() {
+        let conn = Connection::open_in_memory().unwrap();
+        let error = query_sessions(&conn).unwrap_err();
+        assert!(error.contains("no session table"), "unexpected: {error}");
     }
 }

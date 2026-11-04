@@ -130,6 +130,8 @@ pub struct App {
     pub search_input: Input,
     pub search_editing: bool,
     pub show_archived: bool,
+    /// Whether this OpenCode version can archive sessions at all (v1 can, v2 cannot).
+    pub archive_supported: bool,
     pub active_col: usize,
     pub modal: Modal,
     pub toast: Option<Toast>,
@@ -164,6 +166,7 @@ impl App {
             .iter()
             .position(|column| column.id == config.sort)
             .unwrap_or(0);
+        let archive_supported = api.supports_archive();
         let mut app = Self {
             sessions: Vec::new(),
             rows: Vec::new(),
@@ -176,6 +179,7 @@ impl App {
             search_input: Input::default(),
             search_editing: false,
             show_archived: config.show_archived,
+            archive_supported,
             active_col,
             modal: Modal::None,
             toast: None,
@@ -259,8 +263,14 @@ impl App {
     }
 
     fn apply_active(&mut self) {
+        let online = self.api_online;
         for session in &mut self.sessions {
             session.active = self.active_ids.contains(&session.id);
+            if online && !session.active {
+                // The service answered, so its active list wins over the
+                // heuristic busy mark derived from the idle timestamp.
+                session.time_busy = None;
+            }
         }
     }
 
@@ -894,6 +904,13 @@ impl App {
     }
 
     fn archive_selected(&mut self) {
+        if !self.archive_supported {
+            self.notify(
+                "Archiving is not available in this OpenCode version · use D to delete",
+                true,
+            );
+            return;
+        }
         let Some((id, title, status)) = self.selected_details() else {
             return;
         };
@@ -910,6 +927,13 @@ impl App {
     }
 
     fn unarchive_selected(&mut self) {
+        if !self.archive_supported {
+            self.notify(
+                "Unarchiving is not available in this OpenCode version · use D to delete",
+                true,
+            );
+            return;
+        }
         let Some((id, _, status)) = self.selected_details() else {
             return;
         };
@@ -1125,6 +1149,7 @@ mod tests {
             search_input: Input::default(),
             search_editing: false,
             show_archived: false,
+            archive_supported: true,
             active_col: 0,
             modal: Modal::None,
             toast: None,
@@ -1196,6 +1221,20 @@ mod tests {
         assert_eq!(app.on_mouse(click), None);
         assert_eq!(app.table.selected(), Some(1));
         assert_eq!(app.on_mouse(click), Some(1));
+    }
+
+    #[test]
+    fn archive_is_refused_when_unsupported() {
+        let mut app = test_app();
+        app.archive_supported = false;
+        app.archive_selected();
+        let toast = app.toast.as_ref().expect("expected a toast");
+        assert!(toast.error);
+        assert!(
+            toast.text.contains("not available"),
+            "unexpected toast: {}",
+            toast.text
+        );
     }
 
     #[test]

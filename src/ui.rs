@@ -263,11 +263,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             },
         )
     } else {
-        (
+        let actions = if app.archive_supported {
             "Enter open · i detail · d duplicate · r rename · a archive · D delete · m compact"
-                .to_string(),
-            dim(),
-        )
+        } else {
+            "Enter open · i detail · d duplicate · r rename · D delete · m compact"
+        };
+        (actions.to_string(), dim())
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(text, style))),
@@ -291,6 +292,21 @@ fn render_modal(frame: &mut Frame, app: &App, area: Rect) {
     match &app.modal {
         Modal::None => {}
         Modal::Help => {
+            let mut actions = vec![
+                Line::from(Span::styled("Actions", accent())),
+                Line::from("  Enter          open in opencode"),
+                Line::from("  i              call detail"),
+                Line::from("  d              duplicate (fork)"),
+                Line::from("  r              rename"),
+            ];
+            if app.archive_supported {
+                actions.push(Line::from("  a / u          archive / unarchive"));
+            }
+            actions.extend([
+                Line::from("  D              delete (gzip backup)"),
+                Line::from("  m              compact"),
+                Line::from("  R              reload · q quit"),
+            ]);
             let lines = vec![
                 Line::from(Span::styled("Navigation", accent())),
                 Line::from("  ↑↓ / j k       row"),
@@ -306,15 +322,10 @@ fn render_modal(frame: &mut Frame, app: &App, area: Rect) {
                 Line::from("  A              show / hide archived"),
                 Line::from("  c              columns: space, ←→ width, J/K order"),
                 Line::from(""),
-                Line::from(Span::styled("Actions", accent())),
-                Line::from("  Enter          open in opencode"),
-                Line::from("  i              call detail"),
-                Line::from("  d              duplicate (fork)"),
-                Line::from("  r              rename"),
-                Line::from("  a / u          archive / unarchive"),
-                Line::from("  D              delete (gzip backup)"),
-                Line::from("  m              compact"),
-                Line::from("  R              reload · q quit"),
+            ]
+            .into_iter()
+            .chain(actions)
+            .chain([
                 Line::from(""),
                 Line::from(Span::styled("Colors", accent())),
                 Line::from("  green running · blue suspended · gray idle · magenta archived"),
@@ -325,7 +336,8 @@ fn render_modal(frame: &mut Frame, app: &App, area: Rect) {
                     "Mouse: click header to sort, click row to select, double-click to open, wheel scrolls",
                     dim(),
                 )),
-            ];
+            ])
+            .collect::<Vec<_>>();
             draw_modal(frame, area, "Help", lines, 82, 33);
         }
         Modal::Confirm { prompt, .. } => {

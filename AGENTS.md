@@ -24,13 +24,14 @@ cargo run -- --dump          # headless: print rows, no TUI (debugging)
 
 ## OpenCode data
 
-- Live DB: `~/.local/share/opencode/opencode.db` (WAL). Sessions live in **`session_v2`**; ignore legacy `session`, `message`, `part`. Message counts: `session_message`.
+- Live DB: `~/.local/share/opencode/opencode.db` (WAL). Layout is detected per database: **v2** uses `session_v2` + `session_message`; **v1** uses `session` + `message` + `part`. Never hard-code `session_v2` alone: a missing column must become `NULL`, not a query error.
 - Open the DB read-only (`mode=ro`, `busy_timeout`). Actions go through the local API so OpenCode stays the only writer.
 - API URL + password: `~/.local/state/opencode/service.json`. Basic auth user `opencode`, password from that file. `opencode service start` if unreachable.
-- Actions: `PATCH /api/session/{id}` (`title`, `archived`), `POST /api/session/{id}/fork`, `POST /api/session/{id}/compact`, `DELETE /api/session/{id}`, `GET /api/session`.
+- Actions: `PATCH /api/session/{id}` (`title`, `metadata`), `POST /api/session/{id}/fork`, `POST /api/session/{id}/compact`, `DELETE /api/session/{id}`, `GET /api/session`.
 - Open a session: `opencode -s <id> <directory>` (positional directory); suspend/restore the TUI around it.
-- Status comes from `GET /api/session/active` (running) merged with `time_busy`, `time_idle`, `time_suspended`, `idle_outcome`. Archived = `time_archived`.
-- Per-call data is in `session_message.data` (`type='assistant'`): `cost`, `tokens.*`, `model.id`, `finish`, and `content[]` tool parts (`name`, `state.status`). `session_part` is empty in v2; `part` is legacy.
+- Status comes from `GET /api/session/active` (running) merged with `time_busy` (v1), `time_idle`, `time_suspended`, `idle_outcome`. v2 dropped `time_busy`: with the API offline the fallback is `time_updated > time_idle` within 15 minutes (`db::BUSY_WINDOW_MS`).
+- `PATCH` no longer accepts `archived` (v2 ignores it silently, and there is no archive endpoint). `Api::supports_archive` probes `/api/info` for the server version once at startup: on v2 (`major >= 2`) `a`/`u` are hidden and refuse with a message, on v1 they work. `Api::set_archived` also re-reads the session and errors if the server did not apply the change.
+- Per-call data is in the message `data` JSON (`type='assistant'` on v2): `cost`, `tokens.*`, `model.id` or `modelID`, `finish`, and tool parts (`content[]` inline on v2, `part` rows on v1). `session_part` is empty in v2; `part` is v1.
 - Schema is internal and may drift: on query failure fall back to `GET /api/session?limit=1000`.
 
 ## Design decisions

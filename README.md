@@ -7,6 +7,7 @@ A keyboard-first TUI for browsing and managing OpenCode sessions.
 ## Features
 
 - Live sessions table: read-only SQLite polling every 700 ms, running state from the OpenCode API every 2 s.
+- Works with both OpenCode schema generations: v1 (`session`, `message`, `part`) and v2 (`session_v2`, `session_message`). The layout and columns are detected at load time.
 - Sort, global search, per-column filters, show/hide/reorder columns, adjustable widths.
 - Open a session directly in its directory with `opencode -s <id> <dir>`.
 - Rename, fork, archive, unarchive, delete, and compact sessions.
@@ -84,10 +85,25 @@ Detail keys: `↑↓` scroll, `g`/`G` newest/oldest, `PgUp`/`PgDn`, `Ctrl+d`/`Ct
 
 ## Data notes
 
-- Sessions live in `session_v2`; message counts come from `session_message`.
-- Per-call usage is stored in `session_message.data` for `type='assistant'`: `cost`, `tokens.*`, `model.id`, `finish`, and inline tool parts.
+- The database layout is detected at startup: sessions live in `session_v2` (v2) or `session` (v1), messages in `session_message` or `message`/`part`. Columns missing from the installed schema read as empty instead of failing the query.
+- Message counts come from `session_message` (v2) or `message` (v1).
+- Per-call usage is stored in the message `data` JSON: `cost`, `tokens.*`, `model.id` (or `modelID`), `finish`, and tool parts — inline in `content` on v2, in the `part` table on v1.
 - One assistant message is treated as one LLM call. Retries and streaming chunks are not separate calls.
-- The SQLite schema is internal to OpenCode and may drift; the app falls back to `GET /api/session` if a query fails.
+- If a query fails, the app falls back to `GET /api/session`; `--dump` does the same and reports the fallback on stderr.
+
+## OpenCode compatibility
+
+| OpenCode | Database | API |
+|----------|----------|-----|
+| v1 | `session`, `message`, `part`, `time_busy` | list/patch/delete/fork/compact |
+| v2 | `session_v2`, `session_message` | same routes, payload changed |
+
+Notes for v2 (checked against 2.0.19):
+
+- `time.busy` no longer exists. A session is shown as running when the service lists it in `/api/session/active`; with the service unreachable, an update newer than the idle mark (and less than 15 minutes old) is used as a fallback.
+- `/api/session` no longer takes an `archived` filter.
+- **Archiving has no write path.** There is no endpoint, and `PATCH` accepts `archived` then ignores it. ocsess asks `/api/info` for the server version at startup: on v2 the `a`/`u` keys are hidden, and pressing them still explains why. Archived data that already exists stays visible through the `A` filter and the Archived column. On v1 the keys work as before.
+- Fork, rename, delete, and compact keep working unchanged.
 
 ## Files
 

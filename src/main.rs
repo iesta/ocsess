@@ -78,7 +78,15 @@ fn print_help() {
 }
 
 fn dump(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut sessions = db::load_sessions(path)?;
+    let mut sessions = match db::load_sessions(path) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            eprintln!("ocsess: direct DB read failed ({error}), falling back to the API");
+            Api::new().list_sessions().map_err(|api_error| {
+                format!("DB read failed: {error} · API fallback failed: {api_error}")
+            })?
+        }
+    };
     sessions.sort_by_key(|session| std::cmp::Reverse(session.time_updated));
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
