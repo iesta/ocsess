@@ -278,6 +278,9 @@ struct Schema {
     messages: &'static str,
     session_columns: Vec<String>,
     parts: bool,
+    /// Whether the `project` table can be joined, i.e. both it and the
+    /// `project_id` column exist.
+    project: bool,
 }
 
 impl Schema {
@@ -294,11 +297,15 @@ impl Schema {
         let messages = pick(["session_message", "message"]).ok_or_else(|| {
             "no message table in this database (expected session_message or message)".to_string()
         })?;
+        let session_columns = columns(conn, sessions)?;
+        let has_project = objects.iter().any(|object| object == "project")
+            && session_columns.iter().any(|column| column == "project_id");
         Ok(Self {
             sessions,
             messages,
-            session_columns: columns(conn, sessions)?,
+            session_columns,
             parts: objects.iter().any(|object| object == "part"),
+            project: has_project,
         })
     }
 
@@ -365,8 +372,12 @@ fn query_sessions(conn: &Connection) -> Result<Vec<Session>, String> {
     let selects = [
         "s.id".to_string(),
         schema.col("parent_id"),
-        "COALESCE(p.name, '')".to_string(),
-        "s.directory".to_string(),
+        if schema.project {
+            "COALESCE(p.name, '')".to_string()
+        } else {
+            "''".to_string()
+        },
+        schema.col("directory"),
         schema.col("title"),
         schema.col("agent"),
         schema.col("model"),
@@ -388,8 +399,13 @@ fn query_sessions(conn: &Connection) -> Result<Vec<Session>, String> {
             schema.messages
         ),
     ];
+    let join = if schema.project {
+        "LEFT JOIN project p ON p.id = s.project_id"
+    } else {
+        ""
+    };
     let sql = format!(
-        "SELECT {}\n        FROM {} s\n        LEFT JOIN project p ON p.id = s.project_id",
+        "SELECT {}\n        FROM {} s\n        {join}",
         selects.join(", "),
         schema.sessions
     );
@@ -398,7 +414,7 @@ fn query_sessions(conn: &Connection) -> Result<Vec<Session>, String> {
         .map_err(|e| format!("query sessions: {e}"))?;
     let rows = stmt
         .query_map([], |row| {
-            let directory: String = row.get(3)?;
+            let directory: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
             let project: String = row.get(2)?;
             let raw_model: Option<String> = row.get(6)?;
             Ok(Session {
@@ -1018,6 +1034,35 @@ mod tests {
         assert_eq!(calls[0].duration_ms(), Some(2_500));
         assert_eq!(calls[0].tools_label(), "bash");
         assert_eq!(calls[0].tokens_cache_write, 5);
+    }
+
+    #[test]
+    fn reads_schema_without_directory_or_project() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                 id text primary key, title text,
+                 time_created integer not null, time_updated integer not null);
+             CREATE TABLE session_message (
+                 id text primary key, session_id text not null, type text not null,
+                 time_created integer not null, data text not null);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, title, time_created, time_updated)
+             VALUES ('ses_min', 'Minimal', 10, 20)",
+            [],
+        )
+        .unwrap();
+
+        let sessions = query_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].directory, "");
+        assert_eq!(sessions[0].project, "");
+        assert_eq!(sessions[0].title, "Minimal");
+        assert_eq!(sessions[0].messages, 0);
+        // No time_idle column, so the session has never been marked idle.
+        assert_eq!(sessions[0].status(), Status::New);
     }
 
     #[test]
